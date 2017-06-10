@@ -1,4 +1,5 @@
 #include <shlwapi.h>
+#include <utility>
 
 #include "..\MutexHolder\CMutexHolder.h"
 #include "CWebSocket.h"
@@ -319,11 +320,11 @@ void CWebSocket::CWebSocketOnWriteComplete()
 	_sendBuffer.pop();
 	if (_sendBuffer.size())
 	{
-		std::vector<BYTE> message = _sendBuffer.front(); //TODO: As an optimization, we can use move semantics here.
+		std::pair<std::vector<BYTE>, WINHTTP_WEB_SOCKET_BUFFER_TYPE> message= _sendBuffer.front(); //TODO: As an optimization, we can use move semantics here.
 		DWORD dwError = WinHttpWebSocketSend(_hWebSocket,
-			WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-			(PVOID)message.data(),
-			message.size());
+			message.second,
+			(PVOID)message.first.data(),
+			message.first.size());
 		if (dwError != ERROR_SUCCESS)
 			CWebSocketOnError();
 	}
@@ -541,7 +542,7 @@ void CWebSocket::_SendBinaryOrUTF8(const BYTE *message, size_t length, WINHTTP_W
 		CWebSocketOnError();
 		return;
 	}
-	_sendBuffer.push(std::vector<BYTE>(message, message + length));
+	_sendBuffer.push(std::make_pair(std::vector<BYTE>(message, message + length), bufferType));
 	if (_sendBuffer.size() == 1)
 	{
 		DWORD dwError = WinHttpWebSocketSend(_hWebSocket,

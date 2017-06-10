@@ -49,7 +49,7 @@ private:
 	CWebSocketCallbackList *_callbackList;
 	BYTE _winHttpBuffer[WinHttpBufferLength];
 	std::vector<BYTE> _receiveBuffer;
-	std::queue< std::vector<BYTE> > _sendBuffer;
+	std::queue< std::pair<std::vector<BYTE>, WINHTTP_WEB_SOCKET_BUFFER_TYPE> > _sendBuffer;
 	bool _initialized;
 	CWebSocketState _state;
 	HANDLE _hMutex;
