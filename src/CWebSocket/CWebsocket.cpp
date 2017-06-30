@@ -141,7 +141,7 @@ void CWebSocket::CWebSocketOnClose()
 		{
 			_state = CWebSocketState::ExecutingOnClose;
 			_callbackList->onClose(this, _context, usStatus, reason, true);
-			if (_state == CWebSocketState::ExecutingOnClose) // _state might be Error, for ex. if the clien tries to call send or close within its onClose.
+			if (_state == CWebSocketState::ExecutingOnClose) // _state might be Error, for ex. if the client tries to call send or close within its onClose.
 			{
 				CWebSocketOnClosed();
 			}
@@ -217,6 +217,7 @@ void CWebSocket::CWebSocketOnClosing()
 			_callbackList->onClosing(this, _context, usStatus, reason, true);
 		if (_callbackList->onClosing == nullptr || _state == CWebSocketState::ExecutingOnClosing)
 			Close(usStatus, reason); // If there is no onClosing handler, or the handler didn't call Close, echo back the close status and reason sent by the server.
+		delete[] reason;
 	}
 	else
 		CWebSocketOnError();
