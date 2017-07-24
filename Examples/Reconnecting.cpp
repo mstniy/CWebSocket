@@ -1,4 +1,4 @@
-#if 0
+#if 1
 
 #include <iostream>
 #include <windows.h>
@@ -27,19 +27,23 @@ int main()
 		cws.SendWString(helloWorldMessage);
 	}).onUTF8Message([=, &cws](PCWSTR message) {
 		wcout << L"Server responded: \"" << message << L"\"" << endl;
-		wcout << L"Closing connection..." << endl;
-		cws.Close();
-	}).onClose([=, &cws](USHORT code, PCWSTR reason, bool wasClean) {
-		wcout << L"Server responded to our close request." << endl;
-		wcout << L"\tCode: " << code << endl;
-		wcout << L"\tReason: " << reason << endl;
-		wcout << L"\tIt was " << (wasClean ? L"" : L"not ") << L"clean." << endl;
+		Sleep(1000);
+		wcout << L"Sending \"" << helloWorldMessage << L"\" ..." << endl;
+		cws.SendWString(helloWorldMessage);
+	}).onClosing([=, &cws](USHORT code, PCWSTR reason, bool wasClean){
+		if (wasClean == false)
+		{
+			wcout << L"Connection dropped. Reconnecting in 5 seconds." << endl;
+			cws.Connect(5000);
+		}
+		else
+			wcout << L"Server closed the connection. Reason: " << reason << ". Code: " << code << endl;
 	}).onClosed([=]() {
 		wcout << L"Websocket is now closed by both sides. Terminating..." << endl;
 		SetEvent(hEventDone);
-	}).onError([=]() {
-		wcout << L"onError is called. Terminating..." << endl;
-		SetEvent(hEventDone);
+	}).onError([=, &cws]() {
+		wcout << L"onError is called. Reconnecting in 5 seconds." << endl;
+		cws.Connect(5000);
 	}).Connect();
 
 	WaitForSingleObject(hEventDone, INFINITE);
