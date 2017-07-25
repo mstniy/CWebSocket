@@ -1,7 +1,7 @@
 #include <shlwapi.h>
 #include <utility>
 
-#include "CMutexHolder.h"
+#include "MutexHelper.h"
 #include "CWebSocket.h"
 #include "CWebSocketEncodingHelpers.h"
 
@@ -16,6 +16,7 @@ CWebSocket::CWebSocket() :
 	_state(CWebSocketState::NoTcpConnection),
 	_mMutex(nullptr),
 	_eDrainWinHttpCallbacks(nullptr),
+	_eDrainSaqAtCallbacks(nullptr),
 	_eRequestHandleClosed(nullptr),
 	_eWebSocketHandleClosed(nullptr),
 	_reconnectCount(0)
@@ -24,14 +25,17 @@ CWebSocket::CWebSocket() :
 
 CWebSocket::~CWebSocket()
 {
-	_saq.WaitTheQueue(); // Wait for asynchronous method calls to end.
-	_at.Cancel();
-	if (_mMutex != nullptr)
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex); // If there is a WinHTTP callback running right now, wait for it to finish.
-	_Abort();
+	WaitForSingleObject(_mMutex, INFINITE); // If there is an asynchronous callback running right now, wait for it to finish.
+
+	SetEvent(_eDrainSaqAtCallbacks); // Signal pending asynchronous callbacks to return without waiting for the mutex.
+
+	_saq.WaitTheQueue(); // Wait for asynchronous method calls to get drained.
+	_at.Cancel(); // Cancel the timer.
+	_Abort(); // Close WinHttp handles and wait for them to get WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING.
 
 	CloseHandle(_mMutex);
 	CloseHandle(_eDrainWinHttpCallbacks);
+	CloseHandle(_eDrainSaqAtCallbacks);
 	CloseHandle(_eWebSocketHandleClosed);
 	CloseHandle(_eRequestHandleClosed);
 	CoTaskMemFree(_serverName);
@@ -130,7 +134,8 @@ void CWebSocket::CWebSocketOnClose()
 		_state = CWebSocketState::Done;
 		_callbackList.onClose(usStatus, reason, true);
 		_saq.QueueAsyncWork([=]() {
-			ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+			WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
+
 			if (_state == CWebSocketState::Done && _reconnectCount == oldReconCnt) // Make sure the onClose callback didn't call Connect.
 				CWebSocketOnClosed();
 		});
@@ -171,7 +176,6 @@ void CWebSocket::CWebSocketOnSendBufferSent()
 	}
 }
 
-// Called by WinHttp when the server initiates the closing handshake.
 void CWebSocket::CWebSocketOnClosing()
 {
 	PWSTR reason;
@@ -183,6 +187,8 @@ void CWebSocket::CWebSocketOnClosing()
 		_callbackList.onClosing(usStatus, reason, true);
 		delete[] reason;
 		_saq.QueueAsyncWork([=]() {
+			WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
+
 			if (_state == CWebSocketState::ReceivedCloseFrame2 && _reconnectCount == oldReconCnt) // If the onClosing handler didn't call Close, echo back the close status sent by the server.
 				Close(usStatus);
 		});
@@ -214,7 +220,8 @@ void CWebSocket::CWebSocketOnConnectionReset()
 		CWebSocketOnError();
 	}*/
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
+
 		if (_state == CWebSocketState::Done && _reconnectCount == oldReconCnt) // Make sure the callback didn't call Connect.
 			CWebSocketOnClosed();
 	});
@@ -367,16 +374,8 @@ void CALLBACK CWebSocket::CWebSocketCallback(
 		return;
 	}
 
-	const HANDLE handles[2] = { cws->_eDrainWinHttpCallbacks, cws->_mMutex };
-	DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-
-	if (waitResult == WAIT_OBJECT_0) // _eDrainWinHttpCallbacks event is signaled.
-		return;
-	else if (
-		(waitResult != WAIT_OBJECT_0 + 1) &&
-		(waitResult != WAIT_ABANDONED_0 + 1))
-		return; // WaitForMultipleObjects returned error.
-
+	WAIT_FOR_MUTEX_OR_EVENT(cws->_mMutex, cws->_eDrainWinHttpCallbacks);
+	
 	if (cws->_state != CWebSocketState::Error)
 	{
 		if (dwInternetStatus == WINHTTP_CALLBACK_STATUS_CLOSE_COMPLETE)
@@ -427,7 +426,6 @@ void CALLBACK CWebSocket::CWebSocketCallback(
 		else if (dwInternetStatus == WINHTTP_CALLBACK_STATUS_SECURE_FAILURE)
 			cws->CWebSocketOnError();
 	}
-	ReleaseMutex(cws->_mMutex);
 }
 
 bool CWebSocket::Initialize(const WCHAR *__serverName, INTERNET_PORT __port, const WCHAR *__path, bool __secure)
@@ -445,6 +443,8 @@ bool CWebSocket::Initialize(const WCHAR *__serverName, INTERNET_PORT __port, con
 	if (_mMutex != nullptr)
 		_eDrainWinHttpCallbacks = CreateEvent(NULL, TRUE, FALSE, NULL);
 	if (_eDrainWinHttpCallbacks != nullptr)
+		_eDrainSaqAtCallbacks = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (_eDrainSaqAtCallbacks != nullptr)
 		_eWebSocketHandleClosed = CreateEvent(NULL, TRUE, FALSE, NULL);
 	if (_eWebSocketHandleClosed != nullptr)
 		_eRequestHandleClosed = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -479,7 +479,7 @@ void CWebSocket::SendBinary(const BYTE *message, size_t length)
 {
 	std::vector<BYTE> msgc(message, message + length);
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 
 		_ClientSendBinaryOrUTF8(msgc.data(), length, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE);
 	});
@@ -489,23 +489,23 @@ void CWebSocket::SendWString(const WCHAR *message)
 	std::vector<BYTE> UTF8Message;
 	if (cwebsocketinternal::UnicodeToUTF8(message, UTF8Message))
 		_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+			WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 
-		_ClientSendBinaryOrUTF8(UTF8Message.data(), UTF8Message.size(), WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE);
-	});
+			_ClientSendBinaryOrUTF8(UTF8Message.data(), UTF8Message.size(), WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE);
+		});
 	else
 		_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+			WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 
-		CWebSocketOnError();
-	});
+			CWebSocketOnError();
+		});
 }
 void CWebSocket::SendUTF8String(const BYTE *message, size_t length)
 {
 	std::vector<BYTE> msgc(message, message+length);
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
-
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
+		
 		_ClientSendBinaryOrUTF8(msgc.data(), length, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE);
 	});
 }
@@ -513,9 +513,9 @@ void CWebSocket::SendWStringAsBinary(const WCHAR *message)
 {
 	std::wstring msgc(message);
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 
-		size_t length = msgc.length() * sizeof(WCHAR);
+		const size_t length = msgc.length() * sizeof(WCHAR);
 		_ClientSendBinaryOrUTF8((const BYTE*)msgc.c_str(), length, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE);
 	});
 }
@@ -525,37 +525,37 @@ void CWebSocket::Close(USHORT usStatus, const WCHAR *reason)
 	std::vector<BYTE> UTF8Reason;
 	if (cwebsocketinternal::UnicodeToUTF8(reason, UTF8Reason) == false)
 		_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+			WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 
-		CWebSocketOnError();
-	});
+			CWebSocketOnError();
+		});
 	else
 		_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+			WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 
-		if ((_state != CWebSocketState::WaitingForActivity) &&
-			(_state != CWebSocketState::ReceivedCloseFrame2))
-		{
-			CWebSocketOnError();
-			return;
-		}
-		if (_state == CWebSocketState::ReceivedCloseFrame2)
-			_state = CWebSocketState::SendingSendBuffer2; // Closing handshake is initiated by the server.
-		else // _state == CWebSocketState::WaitingForActivity
-			_state = CWebSocketState::SendingSendBuffer1; // Closing handshake is initiated by us.
-		_closeStatus = usStatus;
-		_UTF8CloseReason = UTF8Reason;
-		if (_sendBuffer.size() == 0)
-		{
-			CWebSocketOnSendBufferSent();
-		}
-	});
+			if ((_state != CWebSocketState::WaitingForActivity) &&
+				(_state != CWebSocketState::ReceivedCloseFrame2))
+				CWebSocketOnError();
+			else
+			{
+				if (_state == CWebSocketState::ReceivedCloseFrame2)
+					_state = CWebSocketState::SendingSendBuffer2; // Closing handshake is initiated by the server.
+				else // _state == CWebSocketState::WaitingForActivity
+					_state = CWebSocketState::SendingSendBuffer1; // Closing handshake is initiated by us.
+				_closeStatus = usStatus;
+				_UTF8CloseReason = UTF8Reason;
+				if (_sendBuffer.size() == 0)
+				{
+					CWebSocketOnSendBufferSent();
+				}
+			}
+		});
 }
 
 CWebSocket& CWebSocket::onOpen(CWebSocketOnOpenCallback cb)
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 		_callbackList.onOpen = cb;
 	});
 	return *this;
@@ -564,7 +564,7 @@ CWebSocket& CWebSocket::onOpen(CWebSocketOnOpenCallback cb)
 CWebSocket& CWebSocket::onBinaryMessage(CWebSocketOnBinaryMessageCallback cb)
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 		_callbackList.onBinaryMessage = cb;
 	});
 	return *this;
@@ -573,7 +573,7 @@ CWebSocket& CWebSocket::onBinaryMessage(CWebSocketOnBinaryMessageCallback cb)
 CWebSocket& CWebSocket::onUTF8Message(CWebSocketOnUTF8MessageCallback cb)
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 		_callbackList.onUTF8Message = cb;
 	});
 	return *this;
@@ -582,7 +582,7 @@ CWebSocket& CWebSocket::onUTF8Message(CWebSocketOnUTF8MessageCallback cb)
 CWebSocket& CWebSocket::onClose(CWebSocketOnCloseCallback cb)
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 		_callbackList.onClose = cb;
 	});
 	return *this;
@@ -591,7 +591,7 @@ CWebSocket& CWebSocket::onClose(CWebSocketOnCloseCallback cb)
 CWebSocket& CWebSocket::onClosing(CWebSocketOnClosingCallback cb)
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 		_callbackList.onClosing = cb;
 	});
 	return *this;
@@ -600,7 +600,7 @@ CWebSocket& CWebSocket::onClosing(CWebSocketOnClosingCallback cb)
 CWebSocket& CWebSocket::onClosed(CWebSocketOnClosedCallback cb)
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 		_callbackList.onClosed = cb;
 	});
 	return *this;
@@ -609,7 +609,7 @@ CWebSocket& CWebSocket::onClosed(CWebSocketOnClosedCallback cb)
 CWebSocket& CWebSocket::onError(CWebSocketOnErrorCallback cb)
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 		_callbackList.onError = cb;
 	});
 	return *this;
@@ -618,7 +618,7 @@ CWebSocket& CWebSocket::onError(CWebSocketOnErrorCallback cb)
 void CWebSocket::Connect(DWORD delayms)
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 
 		_reconnectCount++;
 
@@ -638,6 +638,7 @@ void CWebSocket::Connect(DWORD delayms)
 		{
 			_state = CWebSocketState::ConnectPending;
 			_at.Set(delayms, [=]() {
+				WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 				if (_SendUpgradeRequest() == false)
 					CWebSocketOnError();
 			});
@@ -648,7 +649,7 @@ void CWebSocket::Connect(DWORD delayms)
 void CWebSocket::Abort()
 {
 	_saq.QueueAsyncWork([=]() {
-		ACQUIRE_MUTEX_OR_RETURN(_mMutex);
+		WAIT_FOR_MUTEX_OR_EVENT(_mMutex, _eDrainSaqAtCallbacks);
 
 		if ((_state == CWebSocketState::NoTcpConnection) ||
 			(_state == CWebSocketState::ConnectPending) ||

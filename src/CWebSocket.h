@@ -52,6 +52,7 @@ private:
 	CWebSocketState _state;
 	HANDLE _mMutex;
 	HANDLE _eDrainWinHttpCallbacks; // If this event is set, CWebSocketWinHttpCallback will ignore all callbacks from WinHttp except WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING.
+	HANDLE _eDrainSaqAtCallbacks; // If this event is set, asynchronous callbacks from SaqAsyncQueue and AsyncTimer will be ignored.
 	HANDLE _eRequestHandleClosed;
 	HANDLE _eWebSocketHandleClosed;
 	USHORT _closeStatus;
@@ -113,7 +114,7 @@ public:
 	// Send the given unicode message over the websocket as a binary message.
 	void SendWStringAsBinary(const WCHAR *message);
 
-	// Gracefully closes the underlying websocket. To abort a websocket, just destruct it.
+	// Gracefully closes the underlying websocket. To abort a websocket, call Abort or destruct it.
 	// usStatus defaults to WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS (1000) and reason defaults to empty string.
 	// CWebSocket encodes the given reason string in UTF8 before sending it.
 	// Note that CWebSocket will not send a close frame right away if there is data waiting to be sent to the server in the send buffer, but will instead wait for the buffer to be completely sent.
